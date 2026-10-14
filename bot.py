@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -355,13 +356,17 @@ async def _run_action(
 
     if mode == "hapus":
         await _send(src, f"🗑️ Menghapus jurnal <b>{_esc(display)}</b>…")
+        t0 = time.monotonic()
         res = await asyncio.to_thread(hapus_kehadiran, display, iso)
+        elapsed = time.monotonic() - t0
     elif mode == "edit":
         await _send(
             src,
             f"✏️ Memperbarui jurnal <b>{_esc(display)}</b>…\n📌 Baru: {_esc(text)}",
         )
+        t0 = time.monotonic()
         res = await asyncio.to_thread(edit_kehadiran, text, "Hadir", display, iso)
+        elapsed = time.monotonic() - t0
     else:
         status = "Libur" if mode == "libur" else "Hadir"
         icon = "🏖️" if mode == "libur" else "📝"
@@ -370,10 +375,12 @@ async def _run_action(
             src,
             f"{icon} Memproses <b>{label}</b>…\n📅 {_esc(display)}\n📌 {_esc(text)}",
         )
+        t0 = time.monotonic()
         res = await asyncio.to_thread(submit_jurnal_api, iso, text, status)
+        elapsed = time.monotonic() - t0
 
     prefix = "✅" if res.success else "❌"
-    await _send(src, f"{prefix} {_esc(res.message)}", BACK_KB)
+    await _send(src, f"{prefix} {_esc(res.message)}\n\n<i>⏱️ {elapsed:.0f} detik</i>", BACK_KB)
     if not res.success:
         logger.warning("aksi %s gagal: %s", mode, res.message)
     return ConversationHandler.END
