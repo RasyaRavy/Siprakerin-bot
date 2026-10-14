@@ -31,7 +31,8 @@ ID_INDUSTRI = os.getenv("SIPRAKERIN_ID_INDUSTRI", "")
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "2"))
 
 BULAN_ID = [
     "Januari", "Februari", "Maret", "April", "Mei", "Juni",

@@ -32,6 +32,7 @@ from config import (
     KEHADIRAN_URL,
     LOGIN_URL,
     PASSWORD,
+    REQUEST_RETRIES,
     REQUEST_TIMEOUT,
     SUPABASE_ANON_KEY,
     SUPABASE_URL,
@@ -66,6 +67,31 @@ class JurnalRow:
     tanggal: str
     kegiatan: str
     keterangan: str
+
+
+def _req(method: str, url: str, **kw):
+    """requests + retry untuk error jaringan transien.
+
+    Timeout per-request pendek (config REQUEST_TIMEOUT) supaya gagal-cepat,
+    diulang REQUEST_RETRIES kali. Error terakhir dilempar bila tetap gagal.
+    """
+    kw.setdefault("timeout", REQUEST_TIMEOUT)
+    last: Exception | None = None
+    for attempt in range(REQUEST_RETRIES + 1):
+        try:
+            return requests.request(method, url, **kw)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last = e
+            logger.warning(
+                "retry %s %s (%d/%d): %s",
+                method.upper(), url, attempt + 1, REQUEST_RETRIES + 1, e,
+            )
+            if attempt < REQUEST_RETRIES:
+                import time as _time
+
+                _time.sleep(2)
+    assert last is not None
+    raise last
 
 
 def _check_env() -> ActionResult | None:
@@ -126,7 +152,7 @@ def _sb_login() -> tuple[_SbSession | None, ActionResult | None]:
     if missing := _check_env():
         return None, missing
     try:
-        r_auth = requests.post(
+        r_auth = _req("post", 
             f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
             headers={"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"},
             json={"email": EMAIL, "password": PASSWORD},
@@ -162,7 +188,7 @@ def list_riwayat(limit: int = 10) -> tuple[list[JurnalRow], ActionResult | None]
     if err:
         return [], err
     try:
-        r = requests.get(
+        r = _req("get", 
             f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
             headers=sess.auth_headers,
             params={
@@ -193,7 +219,7 @@ def list_riwayat(limit: int = 10) -> tuple[list[JurnalRow], ActionResult | None]
 def _sb_kelas_industri(sess: _SbSession) -> tuple[str | None, str | None]:
     """Tebak id_kelas/id_industri dari jurnal terbaru bila .env kosong."""
     try:
-        r = requests.get(
+        r = _req("get", 
             f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
             headers=sess.auth_headers,
             params={
@@ -243,7 +269,7 @@ def _backfill_tanggal_lama(
     }
     try:
         # Target sudah ada? Jangan timpa diam-diam.
-        r_exist = requests.get(
+        r_exist = _req("get", 
             f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
             headers=sess.auth_headers,
             params={
@@ -262,7 +288,7 @@ def _backfill_tanggal_lama(
             )
 
         # Cari slot keterangan sementara hari ini (hindari unique constraint).
-        r_today = requests.get(
+        r_today = _req("get", 
             f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
             headers=sess.auth_headers,
             params={
@@ -287,7 +313,7 @@ def _backfill_tanggal_lama(
                 "Hapus salah satu baris hari ini dulu.",
             )
 
-        r_create = requests.post(
+        r_create = _req("post", 
             f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
             headers=h_json,
             json={
@@ -310,7 +336,7 @@ def _backfill_tanggal_lama(
 
         def _cleanup() -> None:
             try:
-                requests.delete(
+                _req("delete", 
                     f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
                     headers=sess.auth_headers,
                     params={"id_jurnal": f"eq.{jid}"},
@@ -319,7 +345,7 @@ def _backfill_tanggal_lama(
             except Exception:  # noqa: BLE001
                 logger.warning("cleanup backfill gagal", exc_info=True)
 
-        r_patch = requests.patch(
+        r_patch = _req("patch", 
             f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
             headers=sess.auth_headers,
             params={"id_jurnal": f"eq.{jid}"},
@@ -332,7 +358,7 @@ def _backfill_tanggal_lama(
                 False, f"Gagal memindahkan ke tanggal lama: {r_patch.text[:300]}"
             )
 
-        r_get = requests.get(
+        r_get = _req("get", 
             f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
             headers=sess.auth_headers,
             params={"select": "tanggal", "id_jurnal": f"eq.{jid}"},
@@ -640,7 +666,7 @@ async def _click_save(page) -> ActionResult:
 def _sb_rows_on_date(sess: _SbSession, tanggal_iso: str) -> list[dict] | None:
     """Baris jurnal milik siswa pada tanggal tsb. None bila request gagal."""
     try:
-        r = requests.get(
+        r = _req("get", 
             f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
             headers=sess.auth_headers,
             params={
@@ -672,7 +698,7 @@ def _edit_via_supabase(
         return None
     jid = rows[0]["id_jurnal"]
     try:
-        r = requests.patch(
+        r = _req("patch", 
             f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
             headers=sess.auth_headers,
             params={"id_jurnal": f"eq.{jid}"},
@@ -704,7 +730,7 @@ def _hapus_via_supabase(tanggal_iso: str) -> ActionResult | None:
         return None
     jid = rows[0]["id_jurnal"]
     try:
-        r = requests.delete(
+        r = _req("delete", 
             f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
             headers=sess.auth_headers,
             params={"id_jurnal": f"eq.{jid}"},
