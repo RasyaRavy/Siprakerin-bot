@@ -156,11 +156,13 @@ def _args_tanggal_kegiatan(args: list[str]) -> tuple[str, str | None]:
 # ---------------------------------------------------------------- command dasar
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not _allowed(update):
-        return await _deny(update)
+        await _deny(update)
+        return ConversationHandler.END
     context.user_data.clear()
     await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=MENU_KB)
+    return ConversationHandler.END
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -286,6 +288,9 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     await query.answer()
     action = query.data.split(":", 1)[1]
+    if action in ("riwayat", "help", "menu"):
+        # navigasi non-aksi: bersihkan sisa state alur sebelumnya
+        context.user_data.clear()
     if action == "menu":
         await _menu(update)
         return ConversationHandler.END
@@ -469,7 +474,11 @@ def build_app() -> Application:
         fallbacks=[
             CommandHandler("batal", cancel_cmd),
             CommandHandler("start", start),
-            CallbackQueryHandler(cancel_cmd, pattern=r"^m:menu$"),
+            # Navigasi berlaku di SEMUA state supaya tombol tak pernah "stuck":
+            CallbackQueryHandler(
+                on_menu, pattern=r"^m:(absen|libur|edit|hapus|riwayat|help|menu)$"
+            ),
+            CallbackQueryHandler(cancel_cmd, pattern=r"^d:cancel$"),
         ],
         per_message=False,
     )
@@ -481,8 +490,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("riwayat", riwayat_cmd))
     app.add_handler(CommandHandler("batal", cancel_cmd))
     app.add_handler(conv)
-    # tombol Batal di luar conversation (fallback global)
-    app.add_handler(CallbackQueryHandler(cancel_cmd, pattern=r"^d:cancel$"))
     return app
 
 
