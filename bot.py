@@ -355,13 +355,13 @@ async def _run_action(
 
     if mode == "hapus":
         await _send(src, f"🗑️ Menghapus jurnal <b>{_esc(display)}</b>…")
-        res = await asyncio.to_thread(hapus_kehadiran, display)
+        res = await asyncio.to_thread(hapus_kehadiran, display, iso)
     elif mode == "edit":
         await _send(
             src,
             f"✏️ Memperbarui jurnal <b>{_esc(display)}</b>…\n📌 Baru: {_esc(text)}",
         )
-        res = await asyncio.to_thread(edit_kehadiran, text, "Hadir", display)
+        res = await asyncio.to_thread(edit_kehadiran, text, "Hadir", display, iso)
     else:
         status = "Libur" if mode == "libur" else "Hadir"
         icon = "🏖️" if mode == "libur" else "📝"
@@ -391,12 +391,12 @@ async def on_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     await query.answer()
     display = context.user_data.pop("tanggal_display", "Hari ini")
-    context.user_data.pop("tanggal_iso", None)
+    iso = context.user_data.pop("tanggal_iso", None)
     context.user_data.pop("mode", None)
 
     if query.data == "del:yes":
         await query.edit_message_text(f"🗑️ Menghapus jurnal <b>{_esc(display)}</b>…")
-        res = await asyncio.to_thread(hapus_kehadiran, display)
+        res = await asyncio.to_thread(hapus_kehadiran, display, iso)
         prefix = "✅" if res.success else "❌"
         await query.edit_message_text(
             f"{prefix} {_esc(res.message)}", reply_markup=BACK_KB

@@ -21,6 +21,7 @@ from playwright.async_api import async_playwright
 from playwright.async_api import TimeoutError as PWTimeout
 
 from config import (
+    BASE_URL,
     BULAN_ID,
     DEFAULT_KEGIATAN,
     EMAIL,
@@ -352,6 +353,60 @@ def _backfill_tanggal_lama(
 
 # ---------------------------------------------------------------- API jurnal
 
+def _site_session() -> tuple[requests.Session, dict | None]:
+    """Login API situs via requests (cepat, tanpa browser).
+
+    Mengembalikan (session_dengan_cookie, info_user|None).
+    """
+    s = requests.Session()
+    r = s.post(
+        f"{BASE_URL}/api/auth/login",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.status_code != 200:
+        return s, None
+    try:
+        return s, r.json().get("user")
+    except Exception:  # noqa: BLE001
+        return s, None
+
+
+def _site_post_jurnal(
+    tanggal_iso: str, kegiatan: str, keterangan: str
+) -> tuple[int, dict]:
+    """POST jurnal via requests session (detik, tanpa browser)."""
+    s, _ = _site_session()
+    r = s.post(
+        JURNAL_API_URL,
+        json={
+            "tanggal": tanggal_iso,
+            "kegiatan": kegiatan,
+            "keterangan": keterangan,
+            "id_kelas": int(str(ID_KELAS).strip()),
+            "id_industri": str(ID_INDUSTRI).strip(),
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    try:
+        return r.status_code, r.json()
+    except Exception:  # noqa: BLE001
+        return r.status_code, {"raw": r.text}
+
+
+def _display_to_iso(display: str) -> str | None:
+    """'14 Oktober 2026' -> '2026-10-14'. None bila tak cocok."""
+    try:
+        parts = display.strip().split()
+        if len(parts) != 3:
+            return None
+        day, month_name, year = parts
+        month = BULAN_ID.index(month_name) + 1
+        return f"{int(year):04d}-{month:02d}-{int(day):02d}"
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def _post_jurnal_api(
     page, tanggal_iso: str, kegiatan: str, keterangan: str
 ) -> tuple[int, dict]:
@@ -374,10 +429,34 @@ async def _post_jurnal_api(
     return response.status, body
 
 
+async def _submit_via_browser(
+    tanggal_iso: str, kegiatan: str, keterangan: str
+) -> tuple[int, dict]:
+    """POST jurnal memakai cookie browser Playwright (fallback lambat)."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=HEADLESS)
+        context = await browser.new_context()
+        page = await context.new_page()
+        try:
+            login_result = await _login(page)
+            if not login_result.success:
+                return -1, {"error": login_result.message}
+            return await _post_jurnal_api(page, tanggal_iso, kegiatan, keterangan)
+        finally:
+            try:
+                await browser.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 async def submit_jurnal_api(
     tanggal_iso: str | None = None, kegiatan: str | None = None, status: str = "Hadir"
 ) -> ActionResult:
-    """Submit jurnal; otomatis backfill bila server menolak tanggal lama."""
+    """Submit jurnal; otomatis backfill bila server menolak tanggal lama.
+
+    Jalur cepat (requests, hitungan detik) dicoba dulu; browser Playwright
+    hanya dipakai sebagai fallback bila jalur cepat gagal total.
+    """
     if missing := _check_env():
         return missing
 
@@ -398,41 +477,37 @@ async def submit_jurnal_api(
     kegiatan = kegiatan or DEFAULT_KEGIATAN
     keterangan = status.lower()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
-        context = await browser.new_context()
-        page = await context.new_page()
-        try:
-            login_result = await _login(page)
-            if not login_result.success:
-                return login_result
+    # 1. Jalur cepat dulu (tanpa browser).
+    try:
+        status_code, body = await asyncio.to_thread(
+            _site_post_jurnal, tanggal_iso, kegiatan, keterangan
+        )
+    except Exception:  # noqa: BLE001 — jaringan gagal total -> fallback browser
+        logger.warning("jalur cepat gagal, pakai browser", exc_info=True)
+        status_code, body = await _submit_via_browser(
+            tanggal_iso, kegiatan, keterangan
+        )
 
-            status_code, body = await _post_jurnal_api(
-                page, tanggal_iso, kegiatan, keterangan
-            )
-            if status_code in (200, 201):
-                return ActionResult(
-                    True, f"Jurnal tanggal {tanggal_iso} ({status}) tersimpan."
-                )
-            if status_code == 409:
-                existing = body.get("existing", {}) if isinstance(body, dict) else {}
-                return ActionResult(
-                    False,
-                    f"Jurnal tanggal {tanggal_iso} SUDAH ADA "
-                    f"({existing.get('keterangan', '?')}, id: {existing.get('id_jurnal', '?')}). "
-                    "Pakai Edit untuk mengubahnya.",
-                )
-            if status_code == 400 and "date too old" in str(body).lower():
-                await browser.close()
-                return await asyncio.to_thread(
-                    _backfill_tanggal_lama, tanggal_iso, kegiatan, keterangan
-                )
-            return ActionResult(False, f"API menolak ({status_code}): {body}")
-        finally:
-            try:
-                await browser.close()
-            except Exception:  # noqa: BLE001
-                pass
+    if status_code == -1:
+        return ActionResult(False, f"Login gagal: {body.get('error')}")
+
+    if status_code in (200, 201):
+        return ActionResult(True, f"Jurnal tanggal {tanggal_iso} ({status}) tersimpan.")
+    if status_code == 409:
+        existing = body.get("existing", {}) if isinstance(body, dict) else {}
+        return ActionResult(
+            False,
+            f"Jurnal tanggal {tanggal_iso} SUDAH ADA "
+            f"({existing.get('keterangan', '?')}, id: {existing.get('id_jurnal', '?')}). "
+            "Pakai Edit untuk mengubahnya.",
+        )
+    if status_code == 400 and "date too old" in str(body).lower():
+        # API menolak tanggal lama -> backfill via Supabase
+        # (CREATE hari ini + PATCH ke tanggal target).
+        return await asyncio.to_thread(
+            _backfill_tanggal_lama, tanggal_iso, kegiatan, keterangan
+        )
+    return ActionResult(False, f"API menolak ({status_code}): {body}")
 
 
 # ---------------------------------------------------------------- Browser UI
@@ -562,12 +637,95 @@ async def _click_save(page) -> ActionResult:
     return ActionResult(False, "Tidak ada konfirmasi sukses dari server.")
 
 
+def _sb_rows_on_date(sess: _SbSession, tanggal_iso: str) -> list[dict] | None:
+    """Baris jurnal milik siswa pada tanggal tsb. None bila request gagal."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
+            headers=sess.auth_headers,
+            params={
+                "select": "id_jurnal,tanggal,kegiatan,keterangan",
+                "id_siswa": f"eq.{sess.id_siswa}",
+                "tanggal": f"eq.{tanggal_iso}",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        return r.json() if r.status_code == 200 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _edit_via_supabase(
+    tanggal_iso: str, kegiatan_baru: str, status_baru: str
+) -> ActionResult | None:
+    """PATCH cepat. None = tak bisa diputuskan cepat -> pakai browser.
+
+    Hanya dipakai bila tepat 1 baris (aman, tak ambigu).
+    """
+    sess, err = _sb_login()
+    if err:
+        return None
+    rows = _sb_rows_on_date(sess, tanggal_iso)
+    if not rows:
+        return ActionResult(False, f"Tidak ada jurnal tanggal {tanggal_iso}.")
+    if len(rows) != 1:
+        return None
+    jid = rows[0]["id_jurnal"]
+    try:
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
+            headers=sess.auth_headers,
+            params={"id_jurnal": f"eq.{jid}"},
+            json={"kegiatan": kegiatan_baru, "keterangan": status_baru.lower()},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code not in (200, 204):
+            return None
+        verify = _sb_rows_on_date(sess, tanggal_iso)
+        if verify and verify[0].get("kegiatan") == kegiatan_baru:
+            return ActionResult(True, f"Jurnal tanggal {tanggal_iso} diperbarui.")
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _hapus_via_supabase(tanggal_iso: str) -> ActionResult | None:
+    """DELETE cepat. None = tak bisa diputuskan cepat -> pakai browser.
+
+    Hanya dipakai bila tepat 1 baris (aman, tak ambigu).
+    """
+    sess, err = _sb_login()
+    if err:
+        return None
+    rows = _sb_rows_on_date(sess, tanggal_iso)
+    if not rows:
+        return ActionResult(False, f"Tidak ada jurnal tanggal {tanggal_iso}.")
+    if len(rows) != 1:
+        return None
+    jid = rows[0]["id_jurnal"]
+    try:
+        r = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/daftar_jurnal",
+            headers=sess.auth_headers,
+            params={"id_jurnal": f"eq.{jid}"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code not in (200, 204):
+            return None
+        if not _sb_rows_on_date(sess, tanggal_iso):
+            return ActionResult(True, f"Jurnal tanggal {tanggal_iso} dihapus.")
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def edit_kehadiran(
     kegiatan_baru: str,
     status_baru: str = "Hadir",
     tanggal_cari_display: str | None = None,
+    tanggal_cari_iso: str | None = None,
 ) -> ActionResult:
-    """Edit jurnal pada tanggal tertentu (form edit tak punya field tanggal)."""
+    """Edit jurnal pada tanggal tertentu (jalur cepat dulu, browser fallback)."""
     if missing := _check_env():
         return missing
 
@@ -575,6 +733,12 @@ async def edit_kehadiran(
     status_baru = status_baru.strip().capitalize()
     if status_baru not in ("Hadir", "Libur"):
         return ActionResult(False, "Status harus 'Hadir' atau 'Libur'.")
+
+    iso = tanggal_cari_iso or _display_to_iso(tanggal_cari_display)
+    if iso:
+        fast = await asyncio.to_thread(_edit_via_supabase, iso, kegiatan_baru, status_baru)
+        if fast is not None:
+            return fast
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
@@ -612,12 +776,20 @@ async def edit_kehadiran(
             await browser.close()
 
 
-async def hapus_kehadiran(tanggal_display: str | None = None) -> ActionResult:
-    """Hapus jurnal pada tanggal tertentu via UI."""
+async def hapus_kehadiran(
+    tanggal_display: str | None = None, tanggal_iso: str | None = None
+) -> ActionResult:
+    """Hapus jurnal pada tanggal tertentu (jalur cepat dulu, browser fallback)."""
     if missing := _check_env():
         return missing
 
     tanggal_display = tanggal_display or display_of(_dt.date.today())
+
+    iso = tanggal_iso or _display_to_iso(tanggal_display)
+    if iso:
+        fast = await asyncio.to_thread(_hapus_via_supabase, iso)
+        if fast is not None:
+            return fast
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
